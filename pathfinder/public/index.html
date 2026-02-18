@@ -5,14 +5,15 @@
 <title>NZ Business Finder</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body { font-family: system-ui; margin: 24px; }
-.row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
-input, button { padding: 10px; font-size: 16px; }
-table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-th, td { border-bottom: 1px solid #ddd; padding: 8px; }
-a { color: #0b57d0; text-decoration: none; }
-a:hover { text-decoration: underline; }
-.muted { color: #666; }
+  body { font-family: system-ui; margin: 24px; }
+  .row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+  input, button { padding: 10px; font-size: 16px; }
+  button[disabled] { opacity: 0.6; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+  th, td { border-bottom: 1px solid #ddd; padding: 8px; vertical-align: top; }
+  a { color: #0b57d0; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .muted { color: #666; }
 </style>
 </head>
 <body>
@@ -20,8 +21,8 @@ a:hover { text-decoration: underline; }
 <h1>NZ Business Finder</h1>
 
 <div class="row">
-  <input id="type" placeholder="Business type (e.g. kitchen designer)">
-  <input id="city" placeholder="City (e.g. Christchurch)">
+  <input id="type" placeholder="Business type (e.g. kitchen designer)" />
+  <input id="city" placeholder="City (e.g. Christchurch)" />
 </div>
 
 <div class="row">
@@ -32,55 +33,97 @@ a:hover { text-decoration: underline; }
 <p id="status" class="muted"></p>
 
 <table id="table" style="display:none">
-<thead>
-<tr><th>Business</th><th>Address</th><th>Website</th><th>Email</th></tr>
-</thead>
-<tbody id="body"></tbody>
+  <thead>
+    <tr><th>Business</th><th>Address</th><th>Website</th><th>Email</th></tr>
+  </thead>
+  <tbody id="body"></tbody>
 </table>
 
 <script>
-const $ = id => document.getElementById(id);
+const $ = (id) => document.getElementById(id);
+
+function setStatus(msg) {
+  $("status").textContent = msg;
+}
+
+function escapeHtml(str) {
+  return String(str ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
 
 $("search").onclick = async () => {
-  $("status").textContent = "Searching...";
+  const businessType = $("type").value.trim();
+  const city = $("city").value.trim();
+  const includeWebsiteEmail = $("email").checked;
+
   $("table").style.display = "none";
   $("body").innerHTML = "";
+
+  if (!businessType || !city) {
+    setStatus("Please enter both a business type and a city.");
+    return;
+  }
+
+  $("search").disabled = true;
+  setStatus("Searching...");
 
   try {
     const resp = await fetch("/.netlify/functions/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        businessType: $("type").value,
-        city: $("city").value,
-        includeWebsiteEmail: $("email").checked
-      })
+      body: JSON.stringify({ businessType, city, includeWebsiteEmail })
     });
 
     const raw = await resp.text();
-    const data = raw ? JSON.parse(raw) : {};
 
-    if (!resp.ok) throw new Error(data.error || "Search failed");
+    // Parse JSON safely (so you don’t get “Unexpected end of JSON input”)
+    let data = {};
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      data = {};
+    }
 
-    data.results.forEach(r => {
+    // If the backend returns an error, show the actual message
+    if (!resp.ok) {
+      const message = data?.error || raw || `HTTP ${resp.status}`;
+      throw new Error(message);
+    }
+
+    const results = Array.isArray(data.results) ? data.results : [];
+
+    results.forEach(r => {
       const tr = document.createElement("tr");
 
+      const name = escapeHtml(r.name);
+      const address = escapeHtml(r.address);
+      const email = escapeHtml(r.email || "");
+
+      const mapsUrl = r.google_maps_url || "";
+      const websiteUrl = r.website || "";
+
       tr.innerHTML = `
-        <td><a href="${r.google_maps_url}" target="_blank">${r.name}</a></td>
-        <td>${r.address}</td>
-        <td>${r.website ? `<a href="${r.website}" target="_blank">Website</a>` : ""}</td>
-        <td>${r.email || ""}</td>
+        <td>${mapsUrl ? `<a href="${mapsUrl}" target="_blank" rel="noopener noreferrer">${name}</a>` : name}</td>
+        <td>${address}</td>
+        <td>${websiteUrl ? `<a href="${websiteUrl}" target="_blank" rel="noopener noreferrer">Website</a>` : ""}</td>
+        <td>${email}</td>
       `;
 
       $("body").appendChild(tr);
     });
 
     $("table").style.display = "table";
-    $("status").textContent = `${data.results.length} result(s) found`;
+    setStatus(`${results.length} result(s) found`);
 
   } catch (e) {
-    $("status").textContent =
-      "Backend not running. Use `netlify dev` (NOT Live Server).";
+    // Show the REAL error (this is the critical fix)
+    setStatus(`Error: ${e.message || String(e)}`);
+  } finally {
+    $("search").disabled = false;
   }
 };
 </script>
