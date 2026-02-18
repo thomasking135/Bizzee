@@ -3,31 +3,62 @@ export const handler = async (event) => {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Content-Type": "application/json; charset=utf-8"
+    "Content-Type": "application/json; charset=utf-8",
+    // Helps avoid odd caching while debugging
+    "Cache-Control": "no-store"
   };
 
-  // Preflight
+  // Preflight (CORS)
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers, body: "" };
   }
 
+  // Only allow POST (your browser visiting the function is GET)
+  if (event.httpMethod !== "POST") {
+    return json(headers, 405, { error: "Method not allowed. Use POST." });
+  }
+
   try {
-    if (event.httpMethod !== "POST") {
-      return { statusCode: 405, headers, body: JSON.stringify({ error: "Method not allowed" }) };
-    }
-
     const API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+
+    // Helpful logging for Netlify Function logs
+    console.log("Incoming request:", {
+      method: event.httpMethod,
+      path: event.path,
+      hasBody: !!event.body
+    });
+
     if (!API_KEY) {
-      return { statusCode: 500, headers, body: JSON.stringify({ error: "Missing GOOGLE_MAPS_API_KEY" }) };
+      // This is the #1 production issue
+      return json(headers, 500, {
+        error: "Missing GOOGLE_MAPS_API_KEY",
+        hint: "Add GOOGLE_MAPS_API_KEY in Netlify → Site configuration → Environment variables, then redeploy."
+      });
     }
 
-    const { businessType, city, includeWebsiteEmail } = JSON.parse(event.body || "{}");
+    // Parse body safely
+    let body = {};
+    try {
+      body = JSON.parse(event.body || "{}");
+    } catch {
+      return json(headers, 400, {
+        error: "Invalid JSON body",
+        hint: "Ensure request body is valid JSON with businessType and city."
+      });
+    }
+
+    const { businessType, city, includeWebsiteEmail } = body;
 
     if (!businessType || !city) {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: "businessType and city required" }) };
+      return json(headers, 400, {
+        error: "businessType and city required",
+        example: { businessType: "kitchen designer", city: "Christchurch", includeWebsiteEmail: false }
+      });
     }
 
-    const query = `${businessType} in ${city}, New Zealand`;
+    const query = `${String(businessType).trim()} in ${String(city).trim()}, New Zealand`;
+    console.log("Search query:", query);
+
     const places = await placesTextSearch(API_KEY, query);
 
     const results = [];
@@ -40,13 +71,21 @@ export const handler = async (event) => {
       let website = "";
       let email = "";
 
+      // Email scraping is optional and can be slow/blocky
       if (includeWebsiteEmail && placeId) {
-        await sleep(120);
-        const details = await placeDetails(API_KEY, placeId);
-        website = details.websiteUri || "";
+        try {
+          await sleep(120);
+          const details = await placeDetails(API_KEY, placeId);
+          website = details.websiteUri || "";
 
-        await sleep(120);
-        email = await findEmailFromWebsite(website);
+          if (website) {
+            await sleep(120);
+            email = await findEmailFromWebsite(website);
+          }
+        } catch (e) {
+          // Don’t fail whole request if one website is blocked
+          console.log("Website/email lookup failed:", { placeId, error: e?.message });
+        }
       }
 
       results.push({
@@ -60,22 +99,26 @@ export const handler = async (event) => {
       });
     }
 
-    return {
-      statusCode: 200,
-      headers,
-      body: JSON.stringify({ query, results })
-    };
+    return json(headers, 200, { query, count: results.length, results });
 
   } catch (err) {
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ error: err.message || "Server error" })
-    };
+    console.log("Unhandled error:", err);
+    return json(headers, 500, {
+      error: err?.message || "Server error",
+      hint: "Check Netlify Functions logs for details."
+    });
   }
 };
 
 // ---------------- HELPERS ----------------
+
+function json(headers, statusCode, obj) {
+  return {
+    statusCode,
+    headers,
+    body: JSON.stringify(obj)
+  };
+}
 
 async function placesTextSearch(apiKey, query) {
   const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
@@ -94,12 +137,18 @@ async function placesTextSearch(apiKey, query) {
   });
 
   const text = await resp.text();
-  if (!resp.ok) throw new Error(text);
-  return JSON.parse(text).places || [];
+
+  // If Google returns an error, return a readable message
+  if (!resp.ok) {
+    throw new Error(`Places Text Search failed (${resp.status}): ${cleanGoogleError(text)}`);
+  }
+
+  const data = safeJson(text);
+  return data?.places || [];
 }
 
 async function placeDetails(apiKey, placeId) {
-  const resp = await fetch(`https://places.googleapis.com/v1/places/${placeId}`, {
+  const resp = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
     headers: {
       "X-Goog-Api-Key": apiKey,
       "X-Goog-FieldMask": "websiteUri"
@@ -107,8 +156,12 @@ async function placeDetails(apiKey, placeId) {
   });
 
   const text = await resp.text();
-  if (!resp.ok) throw new Error(text);
-  return JSON.parse(text);
+
+  if (!resp.ok) {
+    throw new Error(`Place Details failed (${resp.status}): ${cleanGoogleError(text)}`);
+  }
+
+  return safeJson(text) || {};
 }
 
 // Only checks BUSINESS WEBSITE (not Google)
@@ -116,10 +169,20 @@ async function findEmailFromWebsite(url) {
   if (!url || !url.startsWith("http")) return "";
 
   try {
-    const resp = await fetch(url, { headers: { "User-Agent": "Pathfinder/1.0" } });
+    // Some sites block bots; we keep it simple and safe
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 6000);
+
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "Pathfinder/1.0" },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeout);
     if (!resp.ok) return "";
 
     const html = await resp.text();
+
     const mailto = html.match(/mailto:([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i);
     if (mailto) return mailto[1];
 
@@ -130,4 +193,18 @@ async function findEmailFromWebsite(url) {
   }
 }
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function safeJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function cleanGoogleError(text) {
+  // Google APIs often return JSON error bodies; try to extract message
+  const data = safeJson(text);
+  const msg =
+    data?.error?.message ||
+    data?.message ||
+    (typeof text === "string" ? text : "");
+  return String(msg).slice(0, 500);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
