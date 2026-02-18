@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NZ Business Finder</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body { font-family: system-ui; margin: 24px; }
+.row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+input, button { padding: 10px; font-size: 16px; }
+table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+th, td { border-bottom: 1px solid #ddd; padding: 8px; }
+a { color: #0b57d0; text-decoration: none; }
+a:hover { text-decoration: underline; }
+.muted { color: #666; }
+</style>
+</head>
+<body>
+
+<h1>NZ Business Finder</h1>
+
+<div class="row">
+  <input id="type" placeholder="Business type (e.g. kitchen designer)">
+  <input id="city" placeholder="City (e.g. Christchurch)">
+</div>
+
+<div class="row">
+  <label><input type="checkbox" id="email"> Try to find email (slower)</label>
+  <button id="search">Search</button>
+</div>
+
+<p id="status" class="muted"></p>
+
+<table id="table" style="display:none">
+<thead>
+<tr><th>Business</th><th>Address</th><th>Website</th><th>Email</th></tr>
+</thead>
+<tbody id="body"></tbody>
+</table>
+
+<script>
+const $ = id => document.getElementById(id);
+
+$("search").onclick = async () => {
+  $("status").textContent = "Searching...";
+  $("table").style.display = "none";
+  $("body").innerHTML = "";
+
+  try {
+    const resp = await fetch("/.netlify/functions/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        businessType: $("type").value,
+        city: $("city").value,
+        includeWebsiteEmail: $("email").checked
+      })
+    });
+
+    const raw = await resp.text();
+    const data = raw ? JSON.parse(raw) : {};
+
+    if (!resp.ok) throw new Error(data.error || "Search failed");
+
+    data.results.forEach(r => {
+      const tr = document.createElement("tr");
+
+      tr.innerHTML = `
+        <td><a href="${r.google_maps_url}" target="_blank">${r.name}</a></td>
+        <td>${r.address}</td>
+        <td>${r.website ? `<a href="${r.website}" target="_blank">Website</a>` : ""}</td>
+        <td>${r.email || ""}</td>
+      `;
+
+      $("body").appendChild(tr);
+    });
+
+    $("table").style.display = "table";
+    $("status").textContent = `${data.results.length} result(s) found`;
+
+  } catch (e) {
+    $("status").textContent =
+      "Backend not running. Use `netlify dev` (NOT Live Server).";
+  }
+};
+</script>
+
+</body>
+</html>
